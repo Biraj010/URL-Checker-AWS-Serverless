@@ -1,0 +1,27 @@
+{
+  "name": "url-checker-aws-serverless",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "sam build",
+    "local:api": "sam local start-api",
+    "deploy": "sam deploy --guided",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.14.9",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.3"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.606.0",
+    "@aws-sdk/client-dynamodb": "^3.606.0",
+    "@aws-sdk/client-sqs": "^3.606.0",
+    "@aws-sdk/lib-dynamodb": "^3.606.0",
+    "@fastify/aws-lambda": "^4.0.0",
+    "fastify": "^4.28.1",
+    "ulid": "^2.3.0",
+    "zod": "^3.23.8"
+  }
+}

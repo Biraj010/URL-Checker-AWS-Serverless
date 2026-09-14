@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  URL Checker - serverless port (API Gateway + Lambda + DynamoDB + SQS + WebSocket API)
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [arm64]
+    Timeout: 15
+    MemorySize: 256
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref UrlCheckerTable
+        CONNECTIONS_GSI: GSI2
+        BATCHES_GSI: GSI1
+        CHECK_QUEUE_URL: !Ref CheckQueue
+        LOG_LEVEL: info
+    LoggingConfig:
+      LogFormat: JSON
+      ApplicationLogLevel: INFO
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+
+Resources:
+  ##########################################################################
+  # Data store
+  ##########################################################################
+  UrlCheckerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub url-checker-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  ##########################################################################
+  # Queue
+  ##########################################################################
+  CheckQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub url-checker-check-dlq-${Stage}
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  CheckQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub url-checker-check-${Stage}
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CheckQueueDLQ.Arn
+        maxReceiveCount: 5
+
+  ##########################################################################
+  # HTTP API (REST-ish endpoints, ported from apps/api)
+  ##########################################################################
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET", "POST", "OPTIONS"]
+        AllowHeaders: ["content-type"]
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub url-checker-api-${Stage}
+      CodeUri: src/api
+      Handler: handler.handler
+      Timeout: 10
+      Events:
+        Proxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UrlCheckerTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt CheckQueue.QueueName
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node20
+        EntryPoints: [handler.ts]
+
+  ##########################################################################
+  # check-url worker (SQS-triggered)
+  ##########################################################################
+  CheckUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub url-checker-check-url-${Stage}
+      CodeUri: src/check-url
+      Handler: handler.handler
+      Timeout: 15
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt CheckQueue.Arn
+            BatchSize: 5
+            MaximumConcurrency: 5 # global in-flight cap, replaces Redis semaphore
+            FunctionResponseTypes: [ReportBatchItemFailures]
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UrlCheckerTable
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node20
+        EntryPoints: [handler.ts]
+
+  ##########################################################################
+  # notify (DynamoDB Streams -> WebSocket push), replaces Redis pub/sub
+  ##########################################################################
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub url-checker-notify-${Stage}
+      CodeUri: src/notify
+      Handler: handler.handler
+      Timeout: 10
+      Environment:
+        Variables:
+          WS_ENDPOINT: !Sub https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt UrlCheckerTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            MaximumRetryAttempts: 3
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UrlCheckerTable
+        - Statement:
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/${Stage}/POST/@connections/*
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node20
+        EntryPoints: [handler.ts]
+
+  ##########################################################################
+  # WebSocket API (live batch progress), replaces SSE
+  ##########################################################################
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub url-checker-ws-${Stage}
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+
+  WsConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub url-checker-ws-connect-${Stage}
+      CodeUri: src/ws-connect
+      Handler: handler.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UrlCheckerTable
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: node20, EntryPoints: [handler.ts] }
+
+  WsDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub url-checker-ws-disconnect-${Stage}
+      CodeUri: src/ws-disconnect
+      Handler: handler.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UrlCheckerTable
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: node20, EntryPoints: [handler.ts] }
+
+  WsSubscribeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub url-checker-ws-subscribe-${Stage}
+      CodeUri: src/ws-subscribe
+      Handler: handler.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UrlCheckerTable
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties: { Minify: true, Target: node20, EntryPoints: [handler.ts] }
+
+  WsConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations
+
+  WsConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      Target: !Sub integrations/${WsConnectIntegration}
+
+  WsDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsDisconnectFunction.Arn}/invocations
+
+  WsDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub integrations/${WsDisconnectIntegration}
+
+  WsSubscribeIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsSubscribeFunction.Arn}/invocations
+
+  WsSubscribeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: subscribe
+      Target: !Sub integrations/${WsSubscribeIntegration}
+
+  WsConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsConnectFunction
+      Principal: apigateway.amazonaws.com
+
+  WsDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsDisconnectFunction
+      Principal: apigateway.amazonaws.com
+
+  WsSubscribePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsSubscribeFunction
+      Principal: apigateway.amazonaws.com
+
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn: [WsConnectRoute, WsDisconnectRoute, WsSubscribeRoute]
+    Properties:
+      ApiId: !Ref WebSocketApi
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      DeploymentId: !Ref WebSocketDeployment
+      StageName: !Ref Stage
+
+Outputs:
+  HttpApiUrl:
+    Description: Base URL for the REST-ish API
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  WebSocketUrl:
+    Description: WSS URL for live batch updates
+    Value: !Sub wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  TableName:
+    Value: !Ref UrlCheckerTable
