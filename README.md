@@ -93,6 +93,21 @@ npm run deploy       # sam deploy --guided, first time
 
 Outputs the HTTP API base URL and the WebSocket (WSS) URL once deployed.
 
+To get email alerts, deploy with an email address:
+
+```bash
+sam deploy --guided --parameter-overrides AlertEmail=you@example.com
+```
+
+(AWS will send a confirmation email to that address — the subscription is inactive until you click confirm.)
+
+## Monitoring & alerts
+
+- **CloudWatch**: every Lambda logs JSON to its own log group (`LoggingConfig` in `template.yaml`) — use these for debugging and metrics.
+- **Dead-letter queue**: `check-url` retries a transient failure up to 5 times (SQS `maxReceiveCount`); after that the message moves to `CheckQueueDLQ` instead of retrying forever.
+- **SNS alert on DLQ depth, not on every failed URL**: a `CloudWatch Alarm` watches `CheckQueueDLQ` and publishes to the `AlertsTopic` SNS topic as soon as any message lands there. This is deliberately *not* per-URL — a batch can have up to 500 URLs and normal 404/403 outcomes are expected, not incidents. A DLQ message means a check failed 5 times and the system gave up, which is the actual "something is wrong" signal (bad message, bug, or a site that's transiently down repeatedly). Subscribe via the `AlertEmail` deploy parameter above, or manually in the SNS console using the `AlertsTopicArn` stack output.
+- **check-url timeout is 15s (Lambda) / 10s (fetch)**, not tighter, on purpose: Lambda bills for actual execution time, not the timeout ceiling, so this costs nothing extra unless a check genuinely takes that long — and a shorter fetch timeout would misreport slow-but-working sites as failures.
+
 ## Why this stack stays (mostly) free
 
 - **Lambda, SQS**: free forever at this scale (1M requests/month each).

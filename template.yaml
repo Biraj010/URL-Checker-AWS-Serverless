@@ -24,6 +24,13 @@ Parameters:
   Stage:
     Type: String
     Default: dev
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email to subscribe to operational alerts (DLQ depth). Leave blank to skip.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
 
 Resources:
   ##########################################################################
@@ -92,6 +99,42 @@ Resources:
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt CheckQueueDLQ.Arn
         maxReceiveCount: 5
+
+  ##########################################################################
+  # Alerting - DLQ depth (a message landing here means a URL check failed
+  # 5x and gave up; individual 404/403 outcomes are normal, not alerted)
+  ##########################################################################
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub url-checker-alerts-${Stage}
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  DlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub url-checker-dlq-depth-${Stage}
+      AlarmDescription: Fires when any message lands in the check-url dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt CheckQueueDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
 
   ##########################################################################
   # HTTP API (REST-ish endpoints, ported from apps/api)
@@ -328,3 +371,6 @@ Outputs:
     Value: !Sub wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
   TableName:
     Value: !Ref UrlCheckerTable
+  AlertsTopicArn:
+    Description: SNS topic for operational alerts (subscribe manually, or redeploy with AlertEmail)
+    Value: !Ref AlertsTopic
